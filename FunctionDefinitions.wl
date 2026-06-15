@@ -269,10 +269,90 @@ SDPResult[rhoIn_,rhoFin_,t_?(VectorQ[#,NumericQ]&),H_?(MatrixQ[#,NumericQ]&),opt
 		#
 		}&[Join@@Table[{Subscript[b, i,l],Subscript[b, j,l]},{l,2,2Length[t]-1}]],
 		{
-		ProcessCombMap[rhoIn,t,H],
+		ProcessMap[rhoIn,t,H],
 		TesterTensor
 		}]
 	]
+];
+
+
+(* ::Subsection:: *)
+(*Dual SDP*)
+
+
+(* ::Text:: *)
+(*Our dual SDP has the form of the canonical input for Mathematica's SemidefiniteOptimization. However, we have to do some preprocessing to turn the complex-variables problem to a real-variables problem. If we choose the matrix basis of Hermitian matrices, the coordinates of any Hermitian matrix are real.*)
+
+
+HermitianBasis[dim_Integer]:=HermitianBasis[dim]=
+(*Constructs and caches an orthonormal matrix basis consisting of dim x dim Hermitian matrices*)
+Join[
+	Table[SparseArray[{{i,i}->1},{dim,dim}],{i,dim}],
+	Flatten[Table[SparseArray[{{j,k}->1/\[Sqrt]2,{k,j}->1/\[Sqrt]2},{dim,dim}],{k,dim},{j,k-1}],1],
+	Flatten[Table[SparseArray[{{j,k}->I/\[Sqrt]2,{k,j}->-(I/\[Sqrt]2)},{dim,dim}],{k,dim},{j,k-1}],1]
+]
+
+
+(* ::Text:: *)
+(*We then apply the causality constraint to each basis element and turn them into real block matrices because m >= 0 iff {{Re[m],-Im[m]},{Im[m],Re[m]}} >= 0*)
+
+
+CausalityConstraintsHermitianBasisRealBlocks[timeSteps_]:=CausalityConstraintsHermitianBasisRealBlocks[timeSteps]=
+Join@@ParallelMap[
+	(t|->Module[
+		{A=t,trLast=mat|->TensorContract[ArrayReshape[mat,{Length[mat]/2,2,Length[mat]/2,2}],{2,4}]},
+		Table[
+			(*For each basis element we successively apply the causality contraint to save time by going through the partial traces only once*)
+			KroneckerProduct[
+				(*x//=f is like x++ if f=x|->x+1*)
+				-(A//=trLast)+KroneckerProduct[A//=trLast,SparseArray[{{1,1}->1/2,{2,2}->1/2}]],
+				SparseArray[{{k_,k_}->1/2^(2i-1)},{2^(2i-1),2^(2i-1)}]
+			]//(m|->ArrayFlatten[{{Re[m],-Im[m]},{Im[m],Re[m]}}]//SparseArray),{i,timeSteps-1}]
+	]),
+	HermitianBasis[4^(timeSteps-1)]
+]
+
+
+(* ::Text:: *)
+(*The DualSDPResult solves the SDP dual to the search over deterministic superinstruments. It scales better in number of time steps than the SDPResult which relies on Mathematica to convert the problem into its canonical form. It is preferable to use Method->"SCS" (or "MOSEK" if available), because it gives the dual unlike "CSDP" or "DSDP". "SCS" also scales better to bigger problems.*)
+
+
+Options[DualSDPResult]=Options[SemidefiniteOptimization];
+DualSDPResult[rhoIn_,rhoFin_,t_?(VectorQ[#,NumericQ]&),H_?(MatrixQ[#,NumericQ]&),opt:OptionsPattern[]]:=
+Module[
+	{
+		timeSteps=Length[t],
+		dim,
+		result,
+		realBlock=m|->ArrayFlatten[{{Re[m],-Im[m]},{Im[m],Re[m]}}]//SparseArray,
+		realBlockConjugate,
+		objectiveVector,constraintMatrices,a0
+	},
+	dim=4^(timeSteps-1);
+	a0=realBlock[SparseArray[-Transpose[ProcessCombMatrix[rhoIn,rhoFin,t,H]]]];
+	objectiveVector=SparseArray[{1->2.^(timeSteps-1)},1+(timeSteps-1)*dim*dim];
+	constraintMatrices=Join[
+		{a0,SparseArray[{{k_,k_}->1},{2dim,2dim}]},
+		CausalityConstraintsHermitianBasisRealBlocks[timeSteps]
+	];
+	result=AssociationThread[
+		{"Population","DualMin","Slack","Tester"},
+		SemidefiniteOptimization[
+			objectiveVector,constraintMatrices,
+			{
+				"DualMaximumValue",
+				"PrimalMinimumValue",
+				"Slack",
+				"DualMaximizer"
+			},
+			Evaluate@FilterRules[{opt}~Join~Options[DualSDPResult],Options[SemidefiniteOptimization]]
+		]
+	];
+	(*Function to turn real blocks back to complex matrices*)
+	realBlockConjugate=m|->Partition[m,{dim,dim}]//(#[[1,1]]+#[[2,2]])-I(#[[1,2]]-#[[2,1]])&//Chop//SparseArray;
+	result["Slack"]//=realBlockConjugate;
+	result["Tester"]//=realBlockConjugate;
+	result
 ];
 
 
@@ -329,5 +409,95 @@ UnitaryStrategy[rhoIn_,rhoTgt_,t_List,H_,opt:OptionsPattern[]]:=Module[{max,sol}
 	Association[
 		"Population"->max,
 		KeyValueMap[ToString[#1]->Unitary@@#2&,Association[sol]]
+	]
+]
+
+
+(* ::Subsection:: *)
+(*Markovian strategies*)
+
+
+(* ::Text:: *)
+(*We also define a heuristic optimisation method for finding Markovian strategies. We start by defining a method to generate random Choi matrices uniformly (https://pubs.aip.org/jmp/article/62/6/062201/1018158/Generating-random-quantum-channels) to serve as seeds*)
+
+
+Options[RandomChoi]={
+	ChoiRank->Automatic
+};
+
+RandomChoi[din_Integer,dout_Integer,opt:OptionsPattern[]]:=
+Module[{G,W,H,M},
+	If[OptionValue[ChoiRank]==Automatic,
+		M=RandomInteger[{1,din dout}]];
+	If[OptionValue[ChoiRank]//IntegerQ,
+		M=OptionValue[ChoiRank]
+	];
+	G=1/\[Sqrt]2 (RandomVariate[NormalDistribution[],{din dout,M}]+I RandomVariate[NormalDistribution[],{din dout,M}]);
+	W=G . ConjugateTranspose[G];
+	H=Inverse[MatrixPower[MatrixPartialTrace[W,2,{din,dout}],1/2]];
+	KroneckerProduct[H,IdentityMatrix[dout]] . W . KroneckerProduct[H,IdentityMatrix[dout]]
+]
+
+RandomChoi[dim_Integer,opt:OptionsPattern[]]:=RandomChoi[dim,dim,opt]
+
+
+(* ::Text:: *)
+(*The idea of the algorithm below is to switch between two semidefinite optimisations. The following method is only applicable to two time steps.*)
+
+
+Options[SeeSawMarkovian]=Join[
+{
+	Seed->{RandomChoi[2],RandomChoi[2]},
+	Tolerance->10^-7,
+	MaxIterations->1000
+}
+];
+SeeSawMarkovian[rhoIn_,rhoFin_,t_?(VectorQ[#,NumericQ]&),H_?(MatrixQ[#,NumericQ]&),opt:OptionsPattern[]]:=Module[
+	{S0,T0,S,T,W,f1,f2,result=<||>},
+	{S0,T0}=OptionValue[Seed];
+	W=ProcessCombMatrix[rhoIn,rhoFin,t,H];
+	f1=Function[With[
+		{Tvar=Array[Indexed[TT,{##}]&,{4,4}]},
+		SemidefiniteOptimization[
+			-Re@Tr[Transpose[W] . KroneckerProduct[#,Tvar]],
+			{
+				VectorGreaterEqual[{TT,0},{"SemidefiniteCone",4}],
+				MatrixPartialTrace[Tvar,2,2]==IdentityMatrix[2]
+			},
+			TT\[Element]Matrices[{4,4},Complexes,Hermitian[{1,2}]],
+			"PrimalMinimizer"
+		]//First//Chop
+	]];
+	f2=Function[With[
+		{Svar=Array[Indexed[SS,{##}]&,{4,4}]},
+		SemidefiniteOptimization[
+			-Re@Tr[Transpose[W] . KroneckerProduct[Svar,#]],
+			{
+				VectorGreaterEqual[{SS,0},{"SemidefiniteCone",4}],
+				MatrixPartialTrace[Svar,2,2]==IdentityMatrix[2]
+			},
+			SS\[Element]Matrices[{4,4},Complexes,Hermitian[{1,2}]],
+			"PrimalMinimizer"
+		]//First//Chop
+	]];
+	If[
+		Dimensions[S0]=={4,4},
+		T0=f1[S0];,
+		If[
+			Dimensions[T0]=={4,4},
+			S0=f2[T0];
+			T0=f1[S0];,
+			Print["Invalid initial seed"];
+			Print[MatrixForm/@{S0,T0}];
+		]
+	];
+	S=FixedPoint[f2@*f1,S0,OptionValue[MaxIterations],SameTest->(Norm[#1-#2]<OptionValue[Tolerance]&)];
+	T=FixedPoint[f1@*f2,T0,OptionValue[MaxIterations],SameTest->(Norm[#1-#2]<OptionValue[Tolerance]&)];
+	AssociateTo[result,
+		{
+			"First"->S,
+			"Second"->T,
+			"Population"->Re@Tr[Transpose[W] . KroneckerProduct[S,T]]//Chop
+		}
 	]
 ]
