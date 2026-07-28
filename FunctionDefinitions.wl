@@ -384,11 +384,13 @@ SetAttributes[UnitaryObjectiveFunction,HoldAll];
 UnitaryObjectiveFunction[rhoIn_,rhoTgt_,t_List,H_]:=With[
 	{vars=ToExpression[Map[StringJoin["U",ToString[#]]&,Range[Length[t]-1]]]},
 	{varsIndexed=Function[s,Array[Indexed[s,#]&,4]]/@vars},
-	Tr[Dot[
-		Transpose[ProcessCombMatrix[rhoIn,rhoTgt,t,H]],
-		KroneckerProduct@@UnitaryChoi@@@varsIndexed
-		]
-	]//Re//ComplexExpand//Chop//Simplify[#,Assumptions->Element[Alternatives@@Flatten@vars,Reals]]&
+	Assuming[Element[Alternatives@@Flatten@varsIndexed,Reals],
+		Tr[Dot[
+			Transpose[ProcessCombMatrix[rhoIn,rhoTgt,t,H]],
+			KroneckerProduct@@UnitaryChoi@@@varsIndexed
+			]
+		]//Refine//Re
+	]
 ]
 
 
