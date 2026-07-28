@@ -204,7 +204,7 @@ ProcessComb[rhoIn_,rhoTgt_,t_List,H_]:=EinsteinSummation[
 
 SetAttributes[ProcessCombMatrix,HoldAll];
 ProcessCombMatrix[rhoIn_,rhoFin_,t_List,H_]:=
-	Nest[ArrayFlatten,#,(Dimensions[#]//Length)/2]&[ProcessComb[rhoIn,rhoFin,t,H]];
+	Nest[ArrayFlatten,#,(Dimensions[#]//Length)/2]&[ProcessComb[rhoIn,rhoFin,t,H]]//SparseArray;
 
 
 (* ::Text:: *)
@@ -373,7 +373,7 @@ Unitary[w_,x_,y_,z_,normalised_:True]:=If[normalised,1/Norm[{w,x,y,z}],1](
 UnitaryChoi[w_,x_,y_,z_,normalised_:True]:=TensorProduct[
 	Flatten[Unitary[w,x,y,z,normalised]//Transpose],
 	Flatten[Unitary[w,-x,y,-z,normalised]//Transpose]
-]//Simplify;
+]//Simplify//SparseArray;
 
 
 (* ::Text:: *)
